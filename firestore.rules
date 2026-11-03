@@ -1,0 +1,57 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidReading(data) {
+      return data.year is number && data.year >= 2000 && data.year <= 2100 &&
+             data.month is number && data.month >= 1 && data.month <= 12 &&
+             data.production is number && data.production >= 0 &&
+             data.meter180 is number && data.meter180 >= 0 &&
+             data.meter280 is number && data.meter280 >= 0 &&
+             data.pricePerKwh is number && data.pricePerKwh >= 0 &&
+             data.userId is string && data.userId == request.auth.uid;
+    }
+
+    function isValidBaseline(data) {
+      return data.year is number && data.year >= 2000 &&
+             data.baseline180 is number && data.baseline180 >= 0 &&
+             data.baseline280 is number && data.baseline280 >= 0 &&
+             data.userId is string && data.userId == request.auth.uid;
+    }
+
+    match /pv_readings/{readingId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidReading(request.resource.data) && (request.resource.data.updatedAt == request.time);
+      allow update: if isSignedIn() && isOwner(resource.data.userId) && 
+                      isValidReading(request.resource.data) &&
+                      request.resource.data.userId == resource.data.userId &&
+                      (request.resource.data.updatedAt == request.time);
+      allow delete: if isSignedIn() && isOwner(resource.data.userId);
+    }
+
+    match /pv_baselines/{baselineId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidBaseline(request.resource.data) && (request.resource.data.updatedAt == request.time);
+      allow update: if isSignedIn() && isOwner(resource.data.userId) && 
+                      isValidBaseline(request.resource.data) &&
+                      (request.resource.data.updatedAt == request.time);
+      allow delete: if isSignedIn() && isOwner(resource.data.userId);
+    }
+  }
+}

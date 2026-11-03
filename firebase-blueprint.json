@@ -1,0 +1,43 @@
+{
+  "entities": {
+    "MonthlyReading": {
+      "title": "Miesięczny Odczyt PV",
+      "description": "Dane z falownika i licznika dla konkretnego miesiąca.",
+      "type": "object",
+      "properties": {
+        "year": { "type": "number", "description": "Rok odczytu" },
+        "month": { "type": "number", "description": "Miesiąc (1-12)" },
+        "production": { "type": "number", "description": "Produkcja miesięczna (P) - podawana jako wartość miesięczna" },
+        "meter180": { "type": "number", "description": "Stan licznika 1.8.0 (Pobranie) na koniec miesiąca" },
+        "meter280": { "type": "number", "description": "Stan licznika 2.8.0 (Oddanie) na koniec miesiąca" },
+        "pricePerKwh": { "type": "number", "description": "Cena za 1 kWh w PLN" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "userId": { "type": "string", "description": "ID użytkownika" }
+      },
+      "required": ["year", "month", "production", "meter180", "meter280", "pricePerKwh", "userId"]
+    },
+    "MeterBaseline": {
+      "title": "Punkt Zero - Stan Początkowy",
+      "description": "Stan licznika na dzień 31 grudnia roku poprzedniego.",
+      "type": "object",
+      "properties": {
+        "year": { "type": "number", "description": "Rok bazowy (np. 2024 dla obliczeń w 2025)" },
+        "baseline180": { "type": "number", "description": "Stan 1.8.0 na 31.12" },
+        "baseline280": { "type": "number", "description": "Stan 2.8.0 na 31.12" },
+        "userId": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["year", "baseline180", "baseline280", "userId"]
+    }
+  },
+  "firestore": {
+    "pv_readings": {
+      "schema": "MonthlyReading",
+      "description": "Kolekcja przechowująca odczyty miesięczne (stany liczników)."
+    },
+    "pv_baselines": {
+      "schema": "MeterBaseline",
+      "description": "Stan początkowy dla każdego roku."
+    }
+  }
+}
