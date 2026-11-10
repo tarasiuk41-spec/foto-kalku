@@ -31,7 +31,8 @@ import {
   Radio,
   Sparkles,
   CheckCircle2,
-  X
+  X,
+  Smartphone
 } from 'lucide-react';
 import { 
   BarChart, 
@@ -83,6 +84,17 @@ import {
   doc, 
   serverTimestamp
 } from 'firebase/firestore';
+import { AndroidShell } from './components/AndroidShell';
+import { AndroidBottomNav, AndroidTab } from './components/AndroidBottomNav';
+import { AndroidQuickBar } from './components/AndroidQuickBar';
+import { AndroidInstallModal } from './components/AndroidInstallModal';
+import { 
+  triggerAndroidHaptic, 
+  isStandalonePWA, 
+  releaseAndroidWakeLock, 
+  requestAndroidWakeLock, 
+  toggleAndroidFullscreen 
+} from './lib/androidBridge';
 
 // Types
 interface PVData {
@@ -102,10 +114,12 @@ interface MeterBaseline {
 
 interface PVReport {
   production: number;
+  productionPln?: number;
   importFromGrid: number;
   exportToGrid: number;
   selfConsumptionKw: number;
   totalConsumptionKw: number;
+  totalConsumptionPln?: number;
   selfConsumptionPercent: number;
   coveragePercent: number;
   savedAmount: number;
@@ -114,6 +128,7 @@ interface PVReport {
   dailyAverage: number;
   correctedGridEnergy: number; // 2.8.0 * 0.8
   gridBalance: number;         // (2.8.0 * 0.8) - 1.8.0
+  gridBalancePln: number;      // (2.8.0 * 0.8 - 1.8.0) * cena (PLN)
   battery5Savings?: number;
   battery10Savings?: number;
   battery5AkBoost?: number;
@@ -132,7 +147,7 @@ export default function App() {
   const [baselines, setBaselines] = useState<MeterBaseline[]>([]);
   const [selectedYear, setSelectedYear] = useState(new Date().getFullYear());
   const [selectedMonth, setSelectedMonth] = useState(new Date().getMonth() + 1);
-  const [view, setView] = useState<'month' | 'year' | 'tariffs'>('month');
+  const [view, setView] = useState<AndroidTab>('month');
   const [theme, setTheme] = useState<'light' | 'dark'>(() => (localStorage.getItem('pv-theme') as 'light' | 'dark') || 'light');
   const [saving, setSaving] = useState(false);
   const [showSetup, setShowSetup] = useState(false);
@@ -142,6 +157,33 @@ export default function App() {
   const [isExporting, setIsExporting] = useState<'pdf' | 'excel' | null>(null);
   const [webhookStatusNotice, setWebhookStatusNotice] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState(new Date());
+
+  // Android OS states
+  const [wakeLockActive, setWakeLockActive] = useState<boolean>(false);
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
+  const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
+  const [isInstalled, setIsInstalled] = useState<boolean>(false);
+  const [showInstallModal, setShowInstallModal] = useState<boolean>(false);
+
+  useEffect(() => {
+    const handleBeforeInstall = (e: any) => {
+      e.preventDefault();
+      setDeferredPrompt(e);
+    };
+    const handleInstalled = () => {
+      setIsInstalled(true);
+      setDeferredPrompt(null);
+    };
+
+    window.addEventListener('beforeinstallprompt', handleBeforeInstall);
+    window.addEventListener('appinstalled', handleInstalled);
+    setIsInstalled(isStandalonePWA());
+
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
+      window.removeEventListener('appinstalled', handleInstalled);
+    };
+  }, []);
 
   useEffect(() => {
     localStorage.setItem('pv-theme', theme);
@@ -381,10 +423,12 @@ export default function App() {
 
     return {
       production: curr.production,
+      productionPln: curr.production * (curr.pricePerKwh || 0),
       importFromGrid: imp,
       exportToGrid: exp,
       selfConsumptionKw: ak,
       totalConsumptionKw: totalZ,
+      totalConsumptionPln: totalZ * (curr.pricePerKwh || 0),
       selfConsumptionPercent: akP,
       coveragePercent: covP,
       savedAmount: saved,
@@ -393,6 +437,7 @@ export default function App() {
       dailyAverage: dailyAvg,
       correctedGridEnergy: correctedExp,
       gridBalance: gBal,
+      gridBalancePln: surplusValue,
       battery5Savings: bat5Kw * curr.pricePerKwh,
       battery10Savings: bat10Kw * curr.pricePerKwh,
       battery5AkBoost: curr.production > 0 ? (bat5Kw / curr.production) * 100 : 0,
@@ -423,6 +468,7 @@ export default function App() {
       financialBalance: acc.financialBalance + curr.financialBalance,
       correctedGridEnergy: acc.correctedGridEnergy + curr.correctedGridEnergy,
       gridBalance: acc.gridBalance + curr.gridBalance,
+      gridBalancePln: acc.gridBalancePln + curr.gridBalancePln,
     }), { 
       production: 0, 
       importFromGrid: 0, 
@@ -430,11 +476,14 @@ export default function App() {
       savedAmount: 0, 
       financialBalance: 0,
       correctedGridEnergy: 0,
-      gridBalance: 0 
+      gridBalance: 0,
+      gridBalancePln: 0
     });
 
-    // Correct production sum
+    // Correct production sum and monetary values
     const totalProd = yearReadings.reduce((a, b) => a + b.production, 0);
+    const totalProdPln = yearReadings.reduce((sum, r) => sum + (r.production * (r.pricePerKwh || 0)), 0);
+    const totalConsumptionPln = monthlyReports.reduce((sum, rep, i) => sum + (rep.totalConsumptionKw * (yearReadings[i]?.pricePerKwh || 0)), 0);
 
     const ak = Math.max(0, totalProd - totals.exportToGrid);
     const totalZ = ak + totals.importFromGrid;
@@ -444,11 +493,14 @@ export default function App() {
     return {
       ...totals,
       production: totalProd,
+      productionPln: totalProdPln,
       selfConsumptionKw: ak,
       totalConsumptionKw: totalZ,
+      totalConsumptionPln: totalConsumptionPln,
       selfConsumptionPercent: akP,
       coveragePercent: covP,
       energyBalance: totals.gridBalance, // Use the 0.8 balance as the main yearly energy balance
+      gridBalancePln: totals.gridBalancePln,
       monthCount: yearReadings.length,
     };
   };
@@ -564,6 +616,7 @@ export default function App() {
     const diff = (c: number, p: number) => p === 0 ? 0 : ((c - p) / p) * 100;
     return [
       { label: "Produkcja", curr: yearSummary.production, prev: prevYearSummary.production, diff: diff(yearSummary.production, prevYearSummary.production), unit: 'kWh' },
+      { label: "Zużycie Domu", curr: yearSummary.totalConsumptionKw, prev: prevYearSummary.totalConsumptionKw, diff: diff(yearSummary.totalConsumptionKw, prevYearSummary.totalConsumptionKw), unit: 'kWh' },
       { label: "Autokonsumpcja", curr: yearSummary.selfConsumptionKw, prev: prevYearSummary.selfConsumptionKw, diff: diff(yearSummary.selfConsumptionKw, prevYearSummary.selfConsumptionKw), unit: 'kWh' },
       { label: "Oszczędności", curr: yearSummary.savedAmount, prev: prevYearSummary.savedAmount, diff: diff(yearSummary.savedAmount, prevYearSummary.savedAmount), unit: 'PLN' }
     ];
@@ -641,243 +694,382 @@ export default function App() {
 
   if (!user) {
     return (
-      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4 selection:bg-emerald-100 selection:text-emerald-900 overflow-hidden relative">
-        <div className="absolute top-0 right-0 w-full h-full opacity-5 pointer-events-none" style={{ backgroundImage: 'radial-gradient(#10b981 1px, transparent 1px)', backgroundSize: '40px 40px' }} />
-        <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} className="max-w-md w-full bg-white rounded-[48px] border border-slate-100 p-12 text-center shadow-[0_32px_64px_-16px_rgba(0,0,0,0.08)] relative z-10 ring-1 ring-slate-100">
-          <div className="w-20 h-20 bg-emerald-500 rounded-3xl flex items-center justify-center mx-auto mb-8 shadow-xl shadow-emerald-500/20 transform rotate-3">
-            <Zap className="text-white fill-white/20 w-10 h-10" />
-          </div>
-          <h1 className="text-3xl font-black text-slate-900 mb-4 uppercase tracking-tighter">Monitoring PV</h1>
-          <p className="text-slate-500 mb-10 leading-relaxed text-sm">Nowoczesny system analizy energii odnawialnej. Zarządzaj swoją instalacją w prosty i przejrzysty sposób.</p>
-          <button onClick={login} className="w-full bg-slate-900 text-white font-black py-5 rounded-2xl flex items-center justify-center gap-3 hover:bg-slate-800 transition-all shadow-xl shadow-slate-900/10 group">
-            <LogIn className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
-            Zaloguj przez Google
-          </button>
-        </motion.div>
-      </div>
+      <AndroidShell theme={theme} currentTime={currentTime} wakeLockActive={wakeLockActive}>
+        <div className="min-h-[80vh] flex flex-col items-center justify-center p-6 text-center">
+          <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className={cn(
+            "w-full max-w-sm rounded-[36px] border p-8 text-center shadow-xl relative",
+            theme === 'dark' ? "bg-slate-900 border-slate-800 text-white" : "bg-white border-slate-100 text-slate-900"
+          )}>
+            <div className="w-16 h-16 bg-emerald-500 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-lg shadow-emerald-500/20">
+              <Zap className="text-white fill-white/20 w-8 h-8" />
+            </div>
+            <div className="inline-block px-3 py-1 rounded-full text-[10px] font-mono font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 mb-3">
+              Dedykowane dla Androida
+            </div>
+            <h1 className="text-2xl font-black mb-2 uppercase tracking-tight">Monitor PV</h1>
+            <p className="text-slate-400 text-xs mb-8 leading-relaxed">System analizy fotowoltaiki, autokonsumpcji, taryf PSE i integracji Smart Home.</p>
+            <button 
+              onClick={() => {
+                triggerAndroidHaptic(20);
+                login();
+              }} 
+              className="w-full bg-slate-900 dark:bg-emerald-600 text-white font-bold py-4 rounded-2xl flex items-center justify-center gap-2 hover:opacity-90 transition-all shadow-lg active:scale-98"
+            >
+              <LogIn className="w-4 h-4" />
+              Zaloguj przez Google
+            </button>
+          </motion.div>
+        </div>
+      </AndroidShell>
     );
   }
 
   return (
-    <div className={cn("min-h-screen font-sans pb-20 selection:bg-emerald-100 transition-colors duration-500", theme === 'dark' ? "bg-slate-950 text-slate-100" : "bg-slate-50 text-slate-900")}>
-      <header className={cn("backdrop-blur-xl border-b sticky top-0 z-50 transition-colors duration-500", theme === 'dark' ? "bg-slate-950/80 border-slate-800" : "bg-white/70 border-slate-100")}>
-        <div className="max-w-7xl mx-auto px-4 h-20 flex items-center justify-between">
-          <div className="flex items-center gap-6">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-emerald-500 rounded-xl flex items-center justify-center shadow-lg shadow-emerald-500/10">
-                <Zap className="text-white fill-white/20 w-6 h-6" />
-              </div>
-              <div className="hidden sm:block">
-                <h1 className={cn("text-sm font-black tracking-widest uppercase leading-none", theme === 'dark' ? "text-white" : "text-slate-900")}>MONITOR PV</h1>
-                <span className="text-[9px] font-bold text-emerald-600 uppercase tracking-widest">Smart Green Energy</span>
-              </div>
-            </div>
-            <div className={cn("hidden lg:flex items-center gap-4 pl-6 border-l", theme === 'dark' ? "border-slate-800" : "border-slate-100")}>
-              <div className="flex flex-col">
-                <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest leading-none mb-1 flex items-center gap-1">
-                  <div className="w-1 h-1 bg-emerald-500 rounded-full animate-pulse" />
-                  Status Systemu
-                </span>
-                <div className="flex items-center gap-2">
-                  <span className={cn("text-xs font-black font-mono", theme === 'dark' ? "text-slate-300" : "text-slate-700")}>
-                    {currentTime.toLocaleDateString('pl-PL')} | {currentTime.toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' })}
+    <AndroidShell theme={theme} currentTime={currentTime} wakeLockActive={wakeLockActive}>
+      <div className={cn("min-h-full font-sans pb-24 selection:bg-emerald-500/20 transition-colors duration-500", theme === 'dark' ? "bg-slate-950 text-slate-100" : "bg-slate-50 text-slate-900")}>
+        {/* Compact Android Top App Bar */}
+        <header className={cn("border-b sticky top-0 z-30 transition-colors duration-500 backdrop-blur-xl px-4 py-2", theme === 'dark' ? "bg-slate-950/90 border-slate-800" : "bg-white/90 border-slate-200")}>
+          <div className="max-w-5xl mx-auto flex flex-col gap-2">
+            {/* Quick action bar */}
+            <AndroidQuickBar
+              theme={theme}
+              onToggleTheme={() => setTheme(t => t === 'light' ? 'dark' : 'light')}
+              wakeLockActive={wakeLockActive}
+              onWakeLockChange={setWakeLockActive}
+              isFullscreen={isFullscreen}
+              onFullscreenChange={setIsFullscreen}
+              onOpenInstall={() => setShowInstallModal(true)}
+              isInstallable={!!deferredPrompt}
+              isInstalled={isInstalled}
+              currentYear={selectedYear}
+              currentMonthName={MONTHS[selectedMonth - 1]}
+              totalProduction={formData.production}
+              totalSavings={currentMonthReport.savedAmount}
+              onNotification={(msg) => {
+                setWebhookStatusNotice(msg);
+                setTimeout(() => setWebhookStatusNotice(null), 4000);
+              }}
+            />
+
+            {/* App brand & Year Selector */}
+            <div className="flex items-center justify-between pt-1">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 bg-emerald-500 rounded-xl flex items-center justify-center shadow-md shadow-emerald-500/20">
+                  <Zap className="text-white fill-white/20 w-4 h-4" />
+                </div>
+                <div>
+                  <h1 className={cn("text-xs font-black tracking-widest uppercase leading-none", theme === 'dark' ? "text-white" : "text-slate-900")}>
+                    MONITOR PV
+                  </h1>
+                  <span className="text-[9px] font-bold text-emerald-500 uppercase tracking-widest flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                    Android Edition
                   </span>
                 </div>
               </div>
-            </div>
-          </div>
-          <div className="flex items-center gap-4">
-            <button 
-              onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
-              className={cn(
-                "p-2.5 rounded-xl transition-all border",
-                theme === 'dark' 
-                  ? "bg-slate-900 border-slate-800 text-yellow-500 hover:bg-slate-800" 
-                  : "bg-white border-slate-200 text-slate-400 hover:text-slate-900 hover:bg-slate-50"
-              )}
-            >
-              {theme === 'light' ? <Moon className="w-5 h-5" /> : <Sun className="w-5 h-5" />}
-            </button>
-            <div className={cn("hidden md:flex items-center gap-3 px-3 py-1.5 border rounded-xl", theme === 'dark' ? "bg-slate-900 border-slate-800" : "bg-slate-50 border-slate-200")}>
-              <img src={user.photoURL || ''} alt="" className="w-6 h-6 rounded-full ring-2 ring-white" />
-              <div className="text-left"><p className={cn("font-bold leading-none text-xs", theme === 'dark' ? "text-slate-200" : "text-slate-700")}>{user.displayName?.split(' ')[0]}</p></div>
-            </div>
-            <button onClick={logout} className="p-2.5 text-slate-400 hover:text-rose-500 hover:bg-rose-50 rounded-xl transition-all"><LogOut className="w-5 h-5" /></button>
-          </div>
-        </div>
-      </header>
 
-      <main className="max-w-7xl mx-auto px-4 py-8">
-        {/* Notifications */}
-        {isLastDayOfMonth() && (
-          <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} className="mb-8 p-4 bg-emerald-50 border border-emerald-100 rounded-2xl flex items-center gap-4 text-emerald-700">
-            <div className="w-12 h-12 bg-emerald-500 rounded-2xl flex items-center justify-center flex-shrink-0 shadow-lg shadow-emerald-500/20 ring-4 ring-white">
-              <Zap className="w-6 h-6 text-white fill-white/20" />
-            </div>
-            <div>
-              <p className="font-black text-xs uppercase tracking-tight">Koniec miesiąca!</p>
-              <p className="text-[10px] font-bold opacity-80 uppercase tracking-widest">Podaj stany liczników, aby zamknąć okres rozliczeniowy.</p>
-            </div>
-          </motion.div>
-        )}
-
-        {/* Webhook Status Notice */}
-        {webhookStatusNotice && (
-          <motion.div 
-            initial={{ opacity: 0, y: -10 }} 
-            animate={{ opacity: 1, y: 0 }} 
-            exit={{ opacity: 0 }} 
-            className="mb-6 p-4 bg-emerald-500/10 border border-emerald-500/30 rounded-2xl flex items-center justify-between gap-3 text-emerald-600 dark:text-emerald-400 text-xs font-bold"
-          >
-            <div className="flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-emerald-500" />
-              <span>{webhookStatusNotice}</span>
-            </div>
-            <button onClick={() => setWebhookStatusNotice(null)} className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </motion.div>
-        )}
-
-        {/* Navigation Breadcrumbs / Summary Bar */}
-        <section className={cn(
-          "rounded-[32px] border p-2 shadow-sm mb-10 flex flex-wrap items-center justify-between gap-4 transition-colors duration-500",
-          theme === 'dark' ? "bg-slate-900 border-slate-800" : "bg-white border-slate-100"
-        )}>
-            <div className="flex items-center">
-              <button 
-                onClick={() => setSelectedYear(y => y-1)} 
-                className={cn("p-3 rounded-2xl text-slate-400 transition-colors", theme === 'dark' ? "hover:bg-slate-800" : "hover:bg-slate-50")}
-              >
-                <ChevronLeft className="w-5 h-5" />
-              </button>
-              <div className={cn("px-6 flex flex-col justify-center border-l", theme === 'dark' ? "border-slate-800" : "border-slate-50")}>
-                <div className="text-[9px] font-bold text-slate-400 uppercase tracking-widest mb-1">Wybrany Rok</div>
-                <div className="flex items-baseline gap-2">
-                  <span className={cn("text-xl font-black font-mono tracking-tighter", theme === 'dark' ? "text-white" : "text-slate-900")}>{selectedYear}</span>
-                </div>
+              {/* Year Switcher (Android touch friendly) */}
+              <div className={cn("flex items-center rounded-xl border px-1 py-0.5", theme === 'dark' ? "bg-slate-900 border-slate-800" : "bg-slate-100 border-slate-200")}>
+                <button 
+                  onClick={() => {
+                    triggerAndroidHaptic(10);
+                    setSelectedYear(y => y-1);
+                  }} 
+                  className="p-1.5 text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                  aria-label="Poprzedni rok"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+                <span className={cn("px-2 font-mono font-black text-xs", theme === 'dark' ? "text-white" : "text-slate-900")}>
+                  {selectedYear}
+                </span>
+                <button 
+                  onClick={() => {
+                    triggerAndroidHaptic(10);
+                    setSelectedYear(y => y+1);
+                  }} 
+                  className="p-1.5 text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                  aria-label="Następny rok"
+                >
+                  <ChevronRight className="w-4 h-4" />
+                </button>
               </div>
-              <button 
-                onClick={() => setSelectedYear(y => y+1)} 
-                className={cn("p-3 rounded-2xl text-slate-400 transition-colors border-l", theme === 'dark' ? "border-slate-800 hover:bg-slate-800" : "border-slate-50 hover:bg-slate-50")}
-              >
-                <ChevronRight className="w-5 h-5" />
-              </button>
-            </div>
 
-            {/* Zakładki przełączania widoku (Miesięczny vs Roczny) */}
-            <div className={cn("flex items-center gap-1 p-1 rounded-2xl border transition-colors", theme === 'dark' ? "bg-slate-950 border-slate-800" : "bg-slate-50 border-slate-100")}>
+              {/* User Avatar & Logout */}
+              <div className="flex items-center gap-2">
+                <div className="flex items-center gap-1.5">
+                  <img src={user.photoURL || ''} alt="" className="w-6 h-6 rounded-full ring-1 ring-emerald-500" />
+                  <span className="text-xs font-bold hidden sm:inline">{user.displayName?.split(' ')[0]}</span>
+                </div>
+                <button 
+                  onClick={() => {
+                    triggerAndroidHaptic(15);
+                    logout();
+                  }} 
+                  className="p-1.5 text-slate-400 hover:text-rose-500 rounded-lg"
+                  title="Wyloguj"
+                >
+                  <LogOut className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <main className="max-w-5xl mx-auto px-3 sm:px-4 py-4 sm:py-6">
+          {/* Notifications */}
+          {isLastDayOfMonth() && (
+            <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} className="mb-6 p-3.5 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-100 dark:border-emerald-800/40 rounded-2xl flex items-center gap-3 text-emerald-700 dark:text-emerald-300">
+              <div className="w-10 h-10 bg-emerald-500 rounded-xl flex items-center justify-center flex-shrink-0 shadow-md shadow-emerald-500/20 ring-2 ring-white dark:ring-slate-900">
+                <Zap className="w-5 h-5 text-white fill-white/20" />
+              </div>
+              <div>
+                <p className="font-black text-xs uppercase tracking-tight">Koniec miesiąca!</p>
+                <p className="text-[10px] font-bold opacity-80 uppercase tracking-widest">Podaj stany liczników, aby zamknąć okres rozliczeniowy.</p>
+              </div>
+            </motion.div>
+          )}
+
+          {/* Webhook Status Notice */}
+          {webhookStatusNotice && (
+            <motion.div 
+              initial={{ opacity: 0, y: -10 }} 
+              animate={{ opacity: 1, y: 0 }} 
+              exit={{ opacity: 0 }} 
+              className="mb-4 p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-2xl flex items-center justify-between gap-3 text-emerald-600 dark:text-emerald-400 text-xs font-bold"
+            >
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 text-emerald-500" />
+                <span>{webhookStatusNotice}</span>
+              </div>
+              <button onClick={() => setWebhookStatusNotice(null)} className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </motion.div>
+          )}
+
+          {/* Quick Segmented View Tabs for Android */}
+          <div className="mb-6 flex items-center justify-between gap-2 overflow-x-auto no-scrollbar pb-1">
+            <div className={cn("inline-flex items-center gap-1 p-1 rounded-2xl border transition-colors", theme === 'dark' ? "bg-slate-900 border-slate-800" : "bg-white border-slate-200")}>
               <button 
-                onClick={() => setView('month')}
+                onClick={() => {
+                  triggerAndroidHaptic(10);
+                  setView('month');
+                }}
                 className={cn(
-                  "px-5 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all",
+                  "px-3.5 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all",
                   view === 'month' 
-                    ? (theme === 'dark' ? "bg-emerald-500 text-white shadow-lg shadow-emerald-500/20" : "bg-slate-900 text-white shadow-md")
-                    : (theme === 'dark' ? "text-slate-500 hover:text-slate-300" : "text-slate-400 hover:text-slate-900")
+                    ? "bg-emerald-600 text-white shadow-sm"
+                    : (theme === 'dark' ? "text-slate-400 hover:text-white" : "text-slate-500 hover:text-slate-900")
                 )}
               >
-                Odczyty Miesięczne
+                Miesiąc
               </button>
               <button 
-                onClick={() => setView('year')}
+                onClick={() => {
+                  triggerAndroidHaptic(10);
+                  setView('year');
+                }}
                 className={cn(
-                  "px-5 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all",
+                  "px-3.5 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all",
                   view === 'year' 
-                    ? (theme === 'dark' ? "bg-emerald-500 text-white shadow-lg shadow-emerald-500/20" : "bg-slate-900 text-white shadow-md")
-                    : (theme === 'dark' ? "text-slate-500 hover:text-slate-300" : "text-slate-400 hover:text-slate-900")
+                    ? "bg-emerald-600 text-white shadow-sm"
+                    : (theme === 'dark' ? "text-slate-400 hover:text-white" : "text-slate-500 hover:text-slate-900")
                 )}
               >
-                Podsumowanie Roku
+                Rok 0.8
               </button>
               <button 
-                onClick={() => setView('tariffs')}
+                onClick={() => {
+                  triggerAndroidHaptic(10);
+                  setView('tariffs');
+                }}
                 className={cn(
-                  "px-5 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-1.5",
+                  "px-3.5 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all flex items-center gap-1",
                   view === 'tariffs' 
-                    ? (theme === 'dark' ? "bg-amber-500 text-white shadow-lg shadow-amber-500/20" : "bg-slate-900 text-white shadow-md")
-                    : (theme === 'dark' ? "text-slate-500 hover:text-slate-300" : "text-slate-400 hover:text-slate-900")
+                    ? "bg-amber-600 text-white shadow-sm"
+                    : (theme === 'dark' ? "text-slate-400 hover:text-white" : "text-slate-500 hover:text-slate-900")
                 )}
               >
-                <Zap className="w-3.5 h-3.5 text-amber-500" />
-                Ceny i Taryfy PSE
+                <Zap className="w-3 h-3 text-amber-400" />
+                Taryfy PSE
+              </button>
+              <button 
+                onClick={() => {
+                  triggerAndroidHaptic(10);
+                  setView('forecast');
+                }}
+                className={cn(
+                  "px-3.5 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all flex items-center gap-1",
+                  view === 'forecast' 
+                    ? "bg-amber-500 text-white shadow-sm"
+                    : (theme === 'dark' ? "text-slate-400 hover:text-white" : "text-slate-500 hover:text-slate-900")
+                )}
+              >
+                <Sun className="w-3 h-3 text-amber-300" />
+                Prognoza
+              </button>
+              <button 
+                onClick={() => {
+                  triggerAndroidHaptic(10);
+                  setView('settings');
+                }}
+                className={cn(
+                  "px-3.5 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all flex items-center gap-1",
+                  view === 'settings' 
+                    ? "bg-purple-600 text-white shadow-sm"
+                    : (theme === 'dark' ? "text-slate-400 hover:text-white" : "text-slate-500 hover:text-slate-900")
+                )}
+              >
+                <Cpu className="w-3 h-3 text-purple-400" />
+                IoT & Opcje
               </button>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2 sm:gap-3 mr-2">
+            {/* Quick Export in top bar */}
+            <div className="flex items-center gap-1 shrink-0">
               <button 
-                onClick={() => setShowSmartHomeModal(true)}
-                className={cn(
-                  "flex items-center gap-2 px-4 py-3 rounded-2xl text-[10px] uppercase font-black tracking-widest transition-all border shadow-sm group",
-                  theme === 'dark' 
-                    ? "bg-slate-950 border-slate-800 text-slate-300 hover:border-emerald-500/50 hover:text-emerald-400" 
-                    : "bg-slate-50 border-slate-200 text-slate-700 hover:border-emerald-400 hover:text-emerald-700 hover:bg-emerald-50/50"
-                )}
-                title="Integracja z Home Assistant, Webhooki i REST API"
+                onClick={() => {
+                  triggerAndroidHaptic(15);
+                  handleExportExcel();
+                }}
+                disabled={isExporting !== null}
+                className="flex items-center gap-1 px-3 py-2 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20 rounded-xl text-[10px] font-bold uppercase transition-all"
+                title="Pobierz Excel"
               >
-                <Cpu className="w-4 h-4 text-emerald-500 group-hover:scale-110 transition-transform" />
-                <span className="hidden sm:inline">Smart Home</span>
-                {smartHomeSettings.webhookUrl && (
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                )}
+                {isExporting === 'excel' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileSpreadsheet className="w-3.5 h-3.5" />}
+                <span className="hidden sm:inline">XLSX</span>
               </button>
 
               <button 
-                onClick={handleExportExcel}
+                onClick={() => {
+                  triggerAndroidHaptic(15);
+                  handleExportPDF();
+                }}
                 disabled={isExporting !== null}
-                className="flex items-center gap-2 px-4 sm:px-5 py-3 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-600 dark:text-emerald-400 border border-emerald-100 dark:border-emerald-800/40 rounded-2xl text-[10px] uppercase font-black tracking-widest hover:bg-emerald-100 transition-all shadow-sm shadow-emerald-500/5 group disabled:opacity-50"
-                title="Pobierz pełne roczne zestawienie w formacie Excel (XLSX)"
+                className="flex items-center gap-1 px-3 py-2 bg-rose-500/10 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 border border-rose-500/20 rounded-xl text-[10px] font-bold uppercase transition-all"
+                title="Pobierz PDF"
               >
-                {isExporting === 'excel' ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileSpreadsheet className="w-4 h-4 group-hover:scale-110 transition-transform" />}
-                <span className="hidden sm:inline">Excel</span>
-              </button>
-
-              <button 
-                onClick={handleExportPDF}
-                disabled={isExporting !== null}
-                className="flex items-center gap-2 px-4 sm:px-5 py-3 bg-rose-50 dark:bg-rose-950/40 text-rose-600 dark:text-rose-400 border border-rose-100 dark:border-rose-800/40 rounded-2xl text-[10px] uppercase font-black tracking-widest hover:bg-rose-100 transition-all shadow-sm shadow-rose-500/5 group disabled:opacity-50"
-                title="Pobierz raport roczny w formacie PDF (zestawienie prosumenckie)"
-              >
-                {isExporting === 'pdf' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4 group-hover:scale-110 transition-transform" />}
+                {isExporting === 'pdf' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
                 <span className="hidden sm:inline">PDF</span>
               </button>
             </div>
-        </section>
+          </div>
 
-        {/* Podsumowanie roczne (Tylko widoczne na górze w widoku miesięcznym) */}
+          {/* Podsumowanie roczne (Tylko widoczne na górze w widoku miesięcznym) */}
         {view === 'month' && yearSummary && (
           <motion.section 
             initial={{ opacity: 0, y: 10 }} 
             animate={{ opacity: 1, y: 0 }}
             className={cn(
-              "rounded-[32px] border p-8 shadow-sm mb-10 overflow-hidden relative group transition-colors duration-500",
+              "rounded-[32px] border p-8 shadow-sm mb-10 relative group transition-colors duration-500",
               theme === 'dark' ? "bg-slate-900 border-slate-800" : "bg-white border-slate-100"
             )}
           >
-            <div className="absolute top-0 right-0 p-8 opacity-5 group-hover:opacity-10 transition-opacity">
-              <BarChart3 className={cn("w-20 h-20", theme === 'dark' ? "text-slate-500" : "text-slate-200")} />
+            <div className="absolute inset-0 rounded-[32px] overflow-hidden pointer-events-none">
+              <div className="absolute top-0 right-0 p-8 opacity-5 group-hover:opacity-10 transition-opacity">
+                <BarChart3 className={cn("w-20 h-20", theme === 'dark' ? "text-slate-500" : "text-slate-200")} />
+              </div>
             </div>
+
             <h3 className={cn("text-[10px] font-black uppercase tracking-[0.2em] mb-8 border-b pb-4 flex items-center justify-between", theme === 'dark' ? "text-slate-500 border-slate-800" : "text-slate-400 border-slate-50")}>
               <span>Podsumowanie Roku {selectedYear}</span>
               <span className="text-emerald-500 font-mono">{yearSummary.monthCount} miesięcy aktywnie</span>
             </h3>
             
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-8">
-              <div className="space-y-1">
-                <p className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">Produkcja PV</p>
-                <p className={cn("text-3xl font-black font-mono tracking-tighter", theme === 'dark' ? "text-emerald-400" : "text-emerald-600")}>
-                  {formatNum(yearSummary.production)} <span className="text-xs">kWh</span>
-                </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-6 xl:gap-8">
+              <div className="space-y-1 relative">
+                <div className="flex items-center gap-1.5">
+                  <p className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">Produkcja PV</p>
+                  <MetricInfoTooltip 
+                    title="Roczna Produkcja PV"
+                    meaning="Całkowita ilość zielonej energii wyprodukowana przez Twoje panele fotowoltaiczne i falownik w ciągu całego roku oraz jej rynkowa wartość."
+                    formula="Ilościowo: Suma odczytów produkcji z falownika (PF) [kWh]. Wartość: Produkcja × Cena za kWh [PLN]"
+                    unit="kWh / PLN"
+                    theme={theme}
+                    align="left"
+                  />
+                </div>
+                <div className="flex items-baseline gap-2">
+                  <p className={cn("text-3xl font-black font-mono tracking-tighter", theme === 'dark' ? "text-emerald-400" : "text-emerald-600")}>
+                    {formatNum(yearSummary.production)}
+                  </p>
+                  <span className="text-xs font-bold text-slate-400">kWh</span>
+                </div>
+                <div className="pt-1">
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-xs font-mono font-black border shadow-sm text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 border-emerald-500/20">
+                    <span>{formatCurrency(yearSummary.productionPln ?? (yearSummary.production * formData.pricePerKwh))}</span>
+                    <span className="text-[9px] font-sans font-bold uppercase tracking-wider opacity-90">
+                      wartość
+                    </span>
+                  </span>
+                </div>
+              </div>
+
+              <div className="space-y-1 relative">
+                <div className="flex items-center gap-1.5">
+                  <p className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">Całkowite Zużycie</p>
+                  <MetricInfoTooltip 
+                    title="Całkowite Zużycie Domu (PC)"
+                    meaning="Rzeczywista energia zużyta w całym domu przez wszystkie odbiorniki – autokonsumpcja bieżąca ze słońca oraz prąd dokupiony z sieci – wraz z jej łącznym kosztem."
+                    formula="Ilościowo: Autokonsumpcja (AK) + Pobranie z sieci (licznik 1.8.0) [kWh]. Wartość: Zużycie × Cena za kWh [PLN]"
+                    unit="kWh / PLN"
+                    theme={theme}
+                    align="left"
+                  />
+                </div>
+                <div className="flex items-baseline gap-2">
+                  <p className={cn("text-3xl font-black font-mono tracking-tighter", theme === 'dark' ? "text-amber-400" : "text-amber-600")}>
+                    {formatNum(yearSummary.totalConsumptionKw)}
+                  </p>
+                  <span className="text-xs font-bold text-slate-400">kWh</span>
+                </div>
+                <div className="pt-1">
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-xs font-mono font-black border shadow-sm text-amber-600 dark:text-amber-400 bg-amber-500/10 border-amber-500/20">
+                    <span>{formatCurrency(yearSummary.totalConsumptionPln ?? (yearSummary.totalConsumptionKw * formData.pricePerKwh))}</span>
+                    <span className="text-[9px] font-sans font-bold uppercase tracking-wider opacity-90">
+                      koszt
+                    </span>
+                  </span>
+                </div>
               </div>
               
-              <div className="space-y-1">
-                <p className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">Wartość Energii</p>
+              <div className="space-y-1 relative">
+                <div className="flex items-center gap-1.5">
+                  <p className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">Wartość Energii</p>
+                  <MetricInfoTooltip 
+                    title="Wartość Energii (Oszczędność)"
+                    meaning="Łączna wartość finansowa wygenerowana przez instalację PV – suma prądu zużytego na miejscu bez opłat oraz wartości energii odebranej z sieci w opuście 0.8."
+                    formula="(Autokonsumpcja × Cena) + (Odebrana z sieci w 0.8 × Cena)"
+                    unit="PLN"
+                    theme={theme}
+                    align="center"
+                  />
+                </div>
                 <p className={cn("text-3xl font-black font-mono tracking-tighter", theme === 'dark' ? "text-blue-400" : "text-blue-600")}>
                   {formatCurrency(yearSummary.savedAmount)}
                 </p>
+                <div className="pt-1">
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-xs font-mono font-bold border shadow-sm text-blue-600 dark:text-blue-400 bg-blue-500/10 border-blue-500/20">
+                    <span className="text-[9px] font-sans font-bold uppercase tracking-wider">
+                      oszczędność PV
+                    </span>
+                  </span>
+                </div>
               </div>
 
-              <div className="space-y-1">
-                <p className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">Bilans (0.8)</p>
+              <div className="space-y-1 relative">
+                <div className="flex items-center gap-1.5">
+                  <p className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">Bilans (0.8)</p>
+                  <MetricInfoTooltip 
+                    title="Bilans Prosumencki (0.8)"
+                    meaning="Ilościowe i finansowe saldo energii w systemie opustów (net-metering dla instalacji ≤ 10 kWp). Wartość (+) oznacza nadpłatę i zapas energii w sieci, a (-) kwotę do zapłaty za brakującą energię."
+                    formula="Ilościowo: (Oddanie × 0.8) − Pobranie [kWh]. Finansowo: Bilans kWh × Cena energii [PLN]"
+                    unit="kWh / PLN"
+                    theme={theme}
+                    align="center"
+                  />
+                </div>
                 <div className="flex items-baseline gap-2">
                   <p className={cn(
                     "text-3xl font-black font-mono tracking-tighter", 
@@ -887,16 +1079,51 @@ export default function App() {
                   </p>
                   <span className="text-xs font-bold text-slate-400">kWh</span>
                 </div>
+                <div className="pt-1">
+                  <span className={cn(
+                    "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-xs font-mono font-black border shadow-sm",
+                    yearSummary.gridBalancePln >= 0 
+                      ? "text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 border-emerald-500/20" 
+                      : "text-rose-600 dark:text-rose-400 bg-rose-500/10 border-rose-500/20"
+                  )}>
+                    <span>{yearSummary.gridBalancePln >= 0 ? '+' : ''}{formatCurrency(yearSummary.gridBalancePln)}</span>
+                    <span className="text-[9px] font-sans font-bold uppercase tracking-wider opacity-90">
+                      {yearSummary.gridBalancePln >= 0 ? 'nadpłata' : 'do zapłaty'}
+                    </span>
+                  </span>
+                </div>
               </div>
 
-              <div className="space-y-1">
-                <p className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">Saldo Finansowe</p>
+              <div className="space-y-1 relative">
+                <div className="flex items-center gap-1.5">
+                  <p className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">Saldo Finansowe</p>
+                  <MetricInfoTooltip 
+                    title="Roczne Saldo Finansowe"
+                    meaning="Ostateczny bilans finansowy Twojej instalacji. Kwota na plusie (+) oznacza czysty zysk roczny, kwota na minusie (-) szacowany koszt energii dokupionej."
+                    formula="Roczny bilans energii (0.8) × Cena za kWh [PLN]"
+                    unit="PLN"
+                    theme={theme}
+                    align="right"
+                  />
+                </div>
                 <p className={cn(
                   "text-3xl font-black font-mono tracking-tighter",
                   yearSummary.financialBalance >= 0 ? "text-emerald-500" : "text-rose-500"
                 )}>
                   {yearSummary.financialBalance >= 0 ? '+' : ''}{formatCurrency(yearSummary.financialBalance)}
                 </p>
+                <div className="pt-1">
+                  <span className={cn(
+                    "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-xs font-mono font-bold border shadow-sm",
+                    yearSummary.financialBalance >= 0 
+                      ? "text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 border-emerald-500/20" 
+                      : "text-rose-600 dark:text-rose-400 bg-rose-500/10 border-rose-500/20"
+                  )}>
+                    <span className="text-[9px] font-sans font-bold uppercase tracking-wider">
+                      {yearSummary.financialBalance >= 0 ? 'zysk netto' : 'koszt netto'}
+                    </span>
+                  </span>
+                </div>
               </div>
             </div>
           </motion.section>
@@ -1100,10 +1327,14 @@ export default function App() {
                            Energia z sieci (x0.8): <span className="text-blue-600 ml-1">{formatNum(currentMonthReport.correctedGridEnergy)} kWh</span>
                         </div>
                         <div className={cn(
-                          "text-[9px] font-black px-3 py-1.5 rounded-full uppercase tracking-tighter border shadow-sm",
+                          "text-[9px] font-black px-3 py-1.5 rounded-full uppercase tracking-tighter border shadow-sm flex items-center gap-1.5",
                           currentMonthReport.gridBalance >= 0 ? "bg-emerald-50/10 border-emerald-500/20 text-emerald-500" : "bg-rose-50/10 border-rose-500/20 text-rose-500"
                         )}>
-                          Bilans energii: {currentMonthReport.gridBalance >= 0 ? '+' : ''}{formatNum(currentMonthReport.gridBalance)} kWh
+                          <span>Bilans energii: {currentMonthReport.gridBalance >= 0 ? '+' : ''}{formatNum(currentMonthReport.gridBalance)} kWh</span>
+                          <span className="font-mono font-bold">
+                            ({currentMonthReport.gridBalancePln >= 0 ? '+' : ''}{formatCurrency(currentMonthReport.gridBalancePln)}{' '}
+                            <span className="opacity-80">{currentMonthReport.gridBalancePln >= 0 ? 'nadpłata' : 'do zapłaty'}</span>)
+                          </span>
                         </div>
                       </div>
                     </div>
@@ -1390,9 +1621,15 @@ export default function App() {
                             <span className={cn("text-xs font-bold px-2 py-0.5 rounded-full uppercase tracking-tighter font-mono", yearSummary.energyBalance >= 0 ? "bg-emerald-500/10 text-emerald-500 border border-emerald-500/20" : "bg-rose-500/10 text-rose-500 border border-rose-500/20")}>
                               {yearSummary.energyBalance >= 0 ? 'B+' : 'B-'}
                             </span>
-                            <span className={cn("text-sm font-black font-mono", yearSummary.energyBalance >= 0 ? "text-emerald-500" : "text-rose-500")}>
-                              {yearSummary.energyBalance >= 0 ? '+' : ''}{formatNum(yearSummary.energyBalance)} kWh
-                            </span>
+                            <div className="flex flex-col items-end leading-tight">
+                              <span className={cn("text-sm font-black font-mono", yearSummary.energyBalance >= 0 ? "text-emerald-500" : "text-rose-500")}>
+                                {yearSummary.energyBalance >= 0 ? '+' : ''}{formatNum(yearSummary.energyBalance)} kWh
+                              </span>
+                              <span className={cn("text-xs font-mono font-bold mt-0.5", yearSummary.gridBalancePln >= 0 ? "text-emerald-500" : "text-rose-500")}>
+                                {yearSummary.gridBalancePln >= 0 ? '+' : ''}{formatCurrency(yearSummary.gridBalancePln)}{' '}
+                                <span className="text-[9px] uppercase font-sans">({yearSummary.gridBalancePln >= 0 ? 'nadpłata' : 'do zapłaty'})</span>
+                              </span>
+                            </div>
                           </div>
                           <p className="text-[10px] text-slate-500 leading-normal">Narastający roczny bilans ilościowy (0.8 × oddanie do sieci minus pobranie) wyliczony od stycznia do grudnia. {yearSummary.energyBalance >= 0 ? 'Posiadasz wypracowaną nadwyżkę energii w sieci.' : 'Masz bilans ujemny w rozliczeniu rocznym.'}</p>
                         </div>
@@ -1659,7 +1896,11 @@ export default function App() {
                               <span className={cn("text-base tracking-tighter font-black", yearSummary.energyBalance >= 0 ? "text-emerald-500" : "text-rose-500")}>
                                 {yearSummary.energyBalance >= 0 ? '+' : ''}{formatNum(yearSummary.energyBalance)} kWh
                               </span>
-                              <span className="text-[9px] text-slate-400 uppercase tracking-widest font-bold">Roczny Bilans</span>
+                              <span className={cn("text-xs font-mono font-bold mt-0.5", yearSummary.gridBalancePln >= 0 ? "text-emerald-500" : "text-rose-500")}>
+                                {yearSummary.gridBalancePln >= 0 ? '+' : ''}{formatCurrency(yearSummary.gridBalancePln)}{' '}
+                                <span className="text-[9px] uppercase font-sans">({yearSummary.gridBalancePln >= 0 ? 'nadpłata' : 'do zapłaty'})</span>
+                              </span>
+                              <span className="text-[9px] text-slate-400 uppercase tracking-widest font-bold mt-1">Roczny Bilans</span>
                             </div>
                           </td>
                           <td className="px-6 py-8 text-right text-xl tracking-tighter shadow-inner">
@@ -1674,12 +1915,206 @@ export default function App() {
                 </div>
               </section>
             </motion.div>
-          ) : (
+          ) : view === 'tariffs' ? (
             <motion.div key="tariffs" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
               <EnergyPriceForecast
                 theme={theme}
                 onOpenSmartHomeModal={() => setShowSmartHomeModal(true)}
               />
+            </motion.div>
+          ) : view === 'forecast' ? (
+            <motion.div key="forecast" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
+              <SolarForecastWidget
+                theme={theme}
+                defaultPeakKwp={smartHomeSettings.peakPowerKwp}
+                onSettingsChange={(kwp, lat, lon, city) => {
+                  const updated = {
+                    ...smartHomeSettings,
+                    peakPowerKwp: kwp,
+                    latitude: lat,
+                    longitude: lon,
+                    cityName: city
+                  };
+                  setSmartHomeSettings(updated);
+                  saveStoredSmartHomeSettings(updated);
+                }}
+              />
+            </motion.div>
+          ) : (
+            <motion.div key="settings" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="space-y-6">
+              {/* Android System Options Card */}
+              <section className={cn(
+                "rounded-[32px] border p-6 shadow-sm transition-colors",
+                theme === 'dark' ? "bg-slate-900 border-slate-800" : "bg-white border-slate-100"
+              )}>
+                <div className="flex items-center gap-3 mb-4">
+                  <div className="w-10 h-10 rounded-2xl bg-emerald-500/15 text-emerald-500 flex items-center justify-center">
+                    <Smartphone className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-black uppercase tracking-tight">Opcje Urządzenia Android</h3>
+                    <p className="text-xs text-slate-400">Optymalizacja sprzętowa dla smartfonów i tabletów ściennych</p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                  {/* WakeLock toggle */}
+                  <div className={cn("p-4 rounded-2xl border flex items-center justify-between gap-3", theme === 'dark' ? "bg-slate-950/60 border-slate-800" : "bg-slate-50 border-slate-200")}>
+                    <div>
+                      <p className="font-bold text-slate-800 dark:text-slate-200">Zawsze włączony ekran (WakeLock)</p>
+                      <p className="text-[11px] text-slate-400">Zapobiega usypianiu ekranu na tablecie ściennym</p>
+                    </div>
+                    <button
+                      onClick={async () => {
+                        triggerAndroidHaptic(20);
+                        if (wakeLockActive) {
+                          await releaseAndroidWakeLock();
+                          setWakeLockActive(false);
+                        } else {
+                          const ok = await requestAndroidWakeLock();
+                          setWakeLockActive(ok);
+                        }
+                      }}
+                      className={cn(
+                        "px-3 py-1.5 rounded-xl font-bold text-xs transition-all",
+                        wakeLockActive ? "bg-emerald-600 text-white" : "bg-slate-200 dark:bg-slate-800 text-slate-600 dark:text-slate-300"
+                      )}
+                    >
+                      {wakeLockActive ? 'WŁ' : 'WYŁ'}
+                    </button>
+                  </div>
+
+                  {/* PWA Install */}
+                  <div className={cn("p-4 rounded-2xl border flex items-center justify-between gap-3", theme === 'dark' ? "bg-slate-950/60 border-slate-800" : "bg-slate-50 border-slate-200")}>
+                    <div>
+                      <p className="font-bold text-slate-800 dark:text-slate-200">Aplikacja na pulpicie (PWA)</p>
+                      <p className="text-[11px] text-slate-400">{isInstalled ? 'Aplikacja zainstalowana jako PWA' : 'Dodaj ikonę do ekranu głównego Androida'}</p>
+                    </div>
+                    <button
+                      onClick={() => {
+                        triggerAndroidHaptic(15);
+                        setShowInstallModal(true);
+                      }}
+                      className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs transition-all"
+                    >
+                      {isInstalled ? 'Zarządzaj' : 'Instaluj'}
+                    </button>
+                  </div>
+
+                  {/* Fullscreen toggle */}
+                  <div className={cn("p-4 rounded-2xl border flex items-center justify-between gap-3", theme === 'dark' ? "bg-slate-950/60 border-slate-800" : "bg-slate-50 border-slate-200")}>
+                    <div>
+                      <p className="font-bold text-slate-800 dark:text-slate-200">Tryb Pełnoekranowy</p>
+                      <p className="text-[11px] text-slate-400">Ukrywa paski systemowe przeglądarki</p>
+                    </div>
+                    <button
+                      onClick={async () => {
+                        triggerAndroidHaptic(15);
+                        const fs = await toggleAndroidFullscreen();
+                        setIsFullscreen(fs);
+                      }}
+                      className="px-3 py-1.5 rounded-xl bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-bold text-xs"
+                    >
+                      {isFullscreen ? 'Zamknij' : 'Włącz'}
+                    </button>
+                  </div>
+
+                  {/* Haptics test */}
+                  <div className={cn("p-4 rounded-2xl border flex items-center justify-between gap-3", theme === 'dark' ? "bg-slate-950/60 border-slate-800" : "bg-slate-50 border-slate-200")}>
+                    <div>
+                      <p className="font-bold text-slate-800 dark:text-slate-200">Wibracje Haptyczne</p>
+                      <p className="text-[11px] text-slate-400">Sprawdź silnik wibracji w smartfonie</p>
+                    </div>
+                    <button
+                      onClick={() => triggerAndroidHaptic([30, 50, 30])}
+                      className="px-3 py-1.5 rounded-xl bg-purple-600 text-white font-bold text-xs hover:bg-purple-700"
+                    >
+                      Testuj
+                    </button>
+                  </div>
+                </div>
+              </section>
+
+              {/* Home Assistant & Smart Home Quick Launcher */}
+              <section className={cn(
+                "rounded-[32px] border p-6 shadow-sm transition-colors",
+                theme === 'dark' ? "bg-slate-900 border-slate-800" : "bg-white border-slate-100"
+              )}>
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-2xl bg-purple-500/15 text-purple-400 flex items-center justify-center">
+                      <Cpu className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-black uppercase tracking-tight">Automatyka Smart Home & IoT</h3>
+                      <p className="text-xs text-slate-400">Integracja z Home Assistant, webhooki i REST API</p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => {
+                      triggerAndroidHaptic(15);
+                      setShowSmartHomeModal(true);
+                    }}
+                    className="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-xl font-bold text-xs shadow-sm transition-all"
+                  >
+                    Otwórz Panel IoT
+                  </button>
+                </div>
+
+                <div className="p-4 rounded-2xl bg-slate-50 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 text-xs space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-500">Adres Webhooka:</span>
+                    <span className="font-mono font-bold text-slate-700 dark:text-slate-300 truncate max-w-xs">
+                      {smartHomeSettings.webhookUrl || 'Nie skonfigurowano'}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-500">Moc instalacji (kWp):</span>
+                    <span className="font-mono font-bold text-emerald-500">{smartHomeSettings.peakPowerKwp} kWp</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-500">Lokalizacja:</span>
+                    <span className="font-bold text-slate-700 dark:text-slate-300">{smartHomeSettings.cityName}</span>
+                  </div>
+                </div>
+              </section>
+
+              {/* Baseline meters calibration */}
+              <section className={cn(
+                "rounded-[32px] border p-6 shadow-sm transition-colors",
+                theme === 'dark' ? "bg-slate-900 border-slate-800" : "bg-white border-slate-100"
+              )}>
+                <h3 className="text-xs font-black uppercase tracking-widest text-slate-400 mb-3">
+                  Kalibracja Liczników (Stan na 31.12 roku poprzedniego)
+                </h3>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <InputField
+                    label="Punkt Zero 1.8.0 (Pobranie)"
+                    unit="kWh"
+                    value={baselineFormData.baseline180}
+                    onChange={(v: number) => setBaselineFormData(b => ({ ...b, baseline180: v }))}
+                    theme={theme}
+                  />
+                  <InputField
+                    label="Punkt Zero 2.8.0 (Oddanie)"
+                    unit="kWh"
+                    value={baselineFormData.baseline280}
+                    onChange={(v: number) => setBaselineFormData(b => ({ ...b, baseline280: v }))}
+                    theme={theme}
+                  />
+                </div>
+                <div className="mt-4 flex justify-end">
+                  <button
+                    onClick={() => {
+                      triggerAndroidHaptic(20);
+                      saveBaseline();
+                    }}
+                    className="px-5 py-2.5 bg-slate-900 dark:bg-emerald-600 text-white font-bold rounded-xl text-xs hover:opacity-90 shadow-sm transition-all"
+                  >
+                    Zapisz Kalibrację Licznika
+                  </button>
+                </div>
+              </section>
             </motion.div>
           )}
         </AnimatePresence>
@@ -1704,23 +2139,26 @@ export default function App() {
         }}
       />
 
-      <footer className={cn("max-w-7xl mx-auto px-4 py-16 border-t mt-20 text-center relative transition-colors duration-500", theme === 'dark' ? "border-slate-800" : "border-slate-100")}>
-        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-48 h-px bg-gradient-to-r from-transparent via-slate-200 to-transparent opacity-20" />
-        <div className="flex flex-col items-center gap-6">
-          <div className={cn("w-12 h-12 rounded-2xl flex items-center justify-center border shadow-sm transition-colors", theme === 'dark' ? "bg-slate-900 border-slate-800" : "bg-slate-50 border-slate-100")}>
-             <Zap className="w-6 h-6 text-emerald-500" />
-          </div>
-          <div className="text-slate-400 text-[10px] font-black uppercase tracking-[0.3em] leading-relaxed">
-            MONITOR PV SMART GREEN ENERGY<br/>
-            <span className={cn("font-bold mt-1 inline-block", theme === 'dark' ? "text-slate-600" : "text-slate-300")}>Professional Analytical Solutions for Renewables</span>
-          </div>
-          <div className="text-[10px] text-slate-400 flex items-center gap-2">
-             <div className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-             © 2026 Powered by Gemini AI
-          </div>
-        </div>
-      </footer>
+      {/* Android Bottom Navigation Bar */}
+      <AndroidBottomNav
+        currentTab={view}
+        onChangeTab={(tab) => {
+          triggerAndroidHaptic(12);
+          setView(tab);
+        }}
+        theme={theme}
+      />
+
+      {/* Android PWA Install Sheet Modal */}
+      <AndroidInstallModal
+        isOpen={showInstallModal}
+        onClose={() => setShowInstallModal(false)}
+        theme={theme}
+        deferredPrompt={deferredPrompt}
+        onInstalled={() => setIsInstalled(true)}
+      />
     </div>
+  </AndroidShell>
   );
 }
 
@@ -1771,3 +2209,98 @@ function MetricCard({ title, value, subValue, description, trend, theme, color =
     </motion.div>
   );
 }
+
+interface MetricInfoTooltipProps {
+  title: string;
+  meaning: string;
+  formula: string;
+  unit?: string;
+  theme: 'light' | 'dark';
+  align?: 'left' | 'center' | 'right';
+}
+
+function MetricInfoTooltip({ title, meaning, formula, unit, theme, align = 'left' }: MetricInfoTooltipProps) {
+  const [isOpen, setIsOpen] = useState(false);
+
+  return (
+    <div 
+      className="relative inline-flex items-center"
+      onMouseEnter={() => setIsOpen(true)}
+      onMouseLeave={() => setIsOpen(false)}
+    >
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          setIsOpen(prev => !prev);
+        }}
+        aria-label={`Informacja: ${title}`}
+        className={cn(
+          "w-4 h-4 rounded-full flex items-center justify-center transition-all cursor-pointer focus:outline-none ring-1",
+          theme === 'dark' 
+            ? "bg-slate-800/80 ring-slate-700/80 text-slate-400 hover:text-emerald-400 hover:bg-slate-800 hover:ring-emerald-500/50" 
+            : "bg-slate-100 ring-slate-200 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 hover:ring-emerald-300"
+        )}
+      >
+        <Info className="w-2.5 h-2.5" />
+      </button>
+
+      <AnimatePresence>
+        {isOpen && (
+          <motion.div
+            initial={{ opacity: 0, y: 6, scale: 0.96 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 4, scale: 0.96 }}
+            transition={{ duration: 0.15 }}
+            className={cn(
+              "absolute z-50 mt-2 p-3.5 rounded-2xl border shadow-2xl backdrop-blur-md w-72 text-left pointer-events-auto",
+              "top-full",
+              align === 'right' ? "right-0" : (align === 'center' ? "left-1/2 -translate-x-1/2" : "left-0"),
+              theme === 'dark'
+                ? "bg-slate-950/95 border-slate-800 text-slate-200 shadow-black/80"
+                : "bg-white/95 border-slate-200 text-slate-800 shadow-slate-900/15"
+            )}
+          >
+            {/* Arrow */}
+            <div 
+              className={cn(
+                "absolute -top-1.5 w-3 h-3 rotate-45 border-l border-t",
+                align === 'right' ? "right-3" : (align === 'center' ? "left-1/2 -translate-x-1/2" : "left-2.5"),
+                theme === 'dark' ? "bg-slate-950 border-slate-800" : "bg-white border-slate-200"
+              )} 
+            />
+
+            <div className="relative z-10 space-y-2">
+              <div className="flex items-center justify-between border-b pb-2 border-slate-100 dark:border-slate-800/80">
+                <span className="font-bold text-xs tracking-tight text-slate-900 dark:text-white flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                  {title}
+                </span>
+                {unit && (
+                  <span className="text-[9px] font-mono font-bold px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400">
+                    {unit}
+                  </span>
+                )}
+              </div>
+
+              <div>
+                <p className="text-[9px] font-black uppercase tracking-wider text-slate-400 mb-0.5">Co oznacza?</p>
+                <p className="text-[11px] leading-relaxed text-slate-600 dark:text-slate-300">
+                  {meaning}
+                </p>
+              </div>
+
+              <div className="pt-1.5 border-t border-slate-100 dark:border-slate-800/80">
+                <p className="text-[9px] font-black uppercase tracking-wider text-slate-400 mb-0.5">Jak jest obliczana?</p>
+                <p className="text-[11px] font-mono leading-relaxed text-emerald-600 dark:text-emerald-400 bg-emerald-500/5 dark:bg-emerald-500/10 p-1.5 rounded-lg border border-emerald-500/15">
+                  {formula}
+                </p>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
