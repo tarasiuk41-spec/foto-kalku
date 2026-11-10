@@ -1,3 +1,28 @@
+import {
+  onAuthStateChanged,
+  signInAnonymously
+} from 'firebase/auth';
+
+useEffect(() => {
+  const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+    if (currentUser) {
+      setUser(currentUser);
+      setLoading(false);
+      return;
+    }
+
+    try {
+      const result = await signInAnonymously(auth);
+      setUser(result.user);
+    } catch (error) {
+      console.error('Błąd automatycznego logowania:', error);
+    } finally {
+      setLoading(false);
+    }
+  });
+
+  return unsubscribe;
+}, []);
 import React, { useState, useMemo, useEffect } from 'react';
 import { 
   Sun,
